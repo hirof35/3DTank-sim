@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <title>3D Tank - Node.js Multiplayer</title>
+    <style>
+        body { margin: 0; background: #222; color: white; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; }
+        canvas { border: 2px solid #555; background: black; }
+        .canvas-container { display: flex; gap: 10px; }
+    </style>
+    <script src="/socket.io/socket.io.js"></script>
+    <script>
+        "use strict";
+        let socket;
+        let ctx, map, width = 600, height = 600;
+        let myId = null;
+        let keymap = [];
+        
+        // ローカルでの自機のカメラ情報
+        let cameraTheta = 0, cameraX = 0, cameraZ = 0;
+        let soundEffect;
+        let currentGameState = { players: [], npcs: [], shots: [], effects: [] };
+
+        // 床（タイル）データをローカルで事前に生成
+        const tileLines = [];
+        for (let x = -200; x < 200; x += 10) {
+            for (let z = -200; z < 200; z += 10) {
+                tileLines.push([
+                    {x: x, y: -5, z: z}, {x: x + 10, y: -5, z: z},
+                    {x: x + 10, y: -5, z: z + 10}, {x: x, y: -5, z: z + 10}
+                ]);
+            }
+        }
+
+        function createMatrixY(radian) {
+            const c = Math.cos(radian);
+            const s = Math.sin(radian);
+            return [c, 0, s, 0, 1, 0, -s, 0, c];
+        }
+
+        function transformVertices(vertices, camX, camZ, camMatrix) {
+            return vertices.map(v => {
+                // カメラ翻訳
+                let tx = v.x - camX;
+                let ty = v.y;
+                let tz = v.z - camZ;
+                // カメラ回転
+                let rx = camMatrix[0] * tx + camMatrix[1] * ty + camMatrix[2] * tz;
+                let ry = camMatrix[3] * tx + camMatrix[4] * ty + camMatrix[5] * tz;
+                let rz = camMatrix[6] * tx + camMatrix[7] * ty + camMatrix[8] * tz;
+                return { x: rx, y: ry, z: rz };
+            });
+        }
+
+        function init() {
+            ctx = document.getElementById("field").getContext("2d");
+            map = document.getElementById("map").getContext("2d");
+            soundEffect = new Audio("https://actions.google.com/sounds/v1/cartoon/slide_whistle_to_drum_hit.ogg"); // テスト用フリー音源（任意に変更してください）
+
+            socket = io();
+
+            socket.on('init', (data) => {
+                myId = data.id;
+            });
+
+            socket.on('update', (state) => {
+                currentGameState = state;
+                // 自機の座標をサーバーからのデータで補正（他者から見た同期ズレを防ぐ）
+                const me = state.players.find(p => p.id === myId);
+                if (me) {
+                    // 必要に応じて位置を完全同期させる場合はここで代入
+                }
+                paint();
+            });
+
+            socket.on('sound', (type) => {
+                if(type === 'bang') soundEffect.play().catch(()=>{});
+            });
+
+            window.onkeydown = (e) => { keymap[e.keyCode] = true; };
+            window.onkeyup = (e) => { keymap[e.keyCode] = false; };
+
+            // 入力判定ループ (50ms)
+            setInterval(tick, 50);
+        }
+
+        function tick() {
+            let moved = false;
+            if (keymap[37]) { cameraTheta += 0.05; moved = true; } // left
+            if (keymap[39]) { cameraTheta -= 0.05; moved = true; } // right
+            if (keymap[38]) {    // up
+                cameraX -= Math.sin(cameraTheta) * 4;
+                cameraZ += Math.cos(cameraTheta) * 4;
+                moved = true;
+            }
+            if (keymap[40]) {    // down
+                cameraX += Math.sin(cameraTheta) * 4;
+                cameraZ -= Math.cos(cameraTheta) * 4;
+                moved = true;
+            }
+            if (keymap[32]) {   // space
+                keymap[32] = false;
+                socket.emit('shoot', { x: cameraX, z: cameraZ, theta: cameraTheta });
+            }
+
+            if (moved && socket && myId) {
+                socket.emit('move', { x: cameraX, z: cameraZ, theta: cameraTheta });
+            }
+        }
+
+        function drawPolygon3D(polygon, color, camX, camZ, camMatrix) {
+            ctx.strokeStyle = color;
+            for (let vertices of polygon) {
+                ctx.beginPath();
+                let transformed = transformVertices(vertices, camX, camZ, camMatrix);
+                
+                for (let k = 0; k < transformed.length; k++) {
+                    let p = transformed[k];
+                    if (p.z <= 0) continue; // クリップ処理
+                    let x = p.x / p.z * 1000 + 300;
+                    let y = -p.y / p.z * 1000 + 300;
+
+                    if (k === 0) ctx.moveTo(x, y);
+                    else ctx.lineTo(x, y);
+                }
+                ctx.stroke();
+            }
+        }
+
+        function paint() {
+            // --- 3D 描画 ---
+            ctx.fillStyle = "black";
+            ctx.fillRect(0, 0, width, height);
+
+            const camMatrix = createMatrixY(cameraTheta);
+
+            // 1. 床タイルの描画
+            drawPolygon3D(tileLines, "#FF0000", cameraX, cameraZ, camMatrix);
+
+            // 2. 他のプレイヤー戦車の描画
+            currentGameState.players.forEach(p => {
+                if (p.id === myId) return; // 自機はカメラ視点なので3D空間には描画しない
+                drawPolygon3D(p.model.work, p.color, cameraX, cameraZ, camMatrix);
+            });
+
+            // 3. NPC戦車の描画
+            currentGameState.npcs.forEach(n => {
+                drawPolygon3D(n.model.work, n.color, cameraX, cameraZ, camMatrix);
+            });
+
+            // 4. 弾の描画
+            currentGameState.shots.forEach(s => {
+                drawPolygon3D(s.model.work, s.color, cameraX, cameraZ, camMatrix);
+            });
+
+            // 5. 爆発エフェクトの描画
+            currentGameState.effects.forEach(e => {
+                drawPolygon3D(e.model.work, e.color, cameraX, cameraZ, camMatrix);
+            });
+
+            // --- 2D レーダーマップ描画 ---
+            map.fillStyle = "black";
+            map.fillRect(0, 0, 300, 300);
+            map.save();
+            map.translate(150, 150);
+            map.scale(3 / 4, -3 / 4);
+
+            // 自機(青)
+            map.fillStyle = "blue";
+            map.fillRect(cameraX, cameraZ, 5, 5);
+
+            // 視界コーン
+            map.fillStyle = "blue";
+            map.globalAlpha = 0.2;
+            map.beginPath();
+            map.moveTo(cameraX, cameraZ);
+            map.arc(cameraX, cameraZ, 300, cameraTheta + Math.PI / 2 - 0.4, cameraTheta + Math.PI / 2 + 0.4);
+            map.fill();
+            map.globalAlpha = 1.0;
+
+            // 他プレイヤー(水色)
+            map.fillStyle = "#00FFFF";
+            currentGameState.players.forEach(p => {
+                if(p.id !== myId) map.fillRect(p.x, p.z, 6, 6);
+            });
+
+            // 敵NPC(緑)
+            map.fillStyle = "lightgreen";
+            currentGameState.npcs.forEach(n => {
+                map.fillRect(n.x, n.z, 7, 7);
+            });
+
+            // 弾(白)
+            map.fillStyle = "white";
+            currentGameState.shots.forEach(s => {
+                map.fillRect(s.x, s.z, 4, 4);
+            });
+
+            map.restore();
+        }
+    </script>
+</head>
+<body onload="init()">
+    <h1>Node.js 3D Tank Multiplayer</h1>
+    <p>矢印キー: 移動 / スペースキー: 射撃 (複数タブや別ブラウザを開くとマルチプレイ可能)</p>
+    <div class="canvas-container">
+        <canvas id="field" width="600" height="600"></canvas>
+        <canvas id="map" width="300" height="300"></canvas>
+    </div>
+</body>
+</html>
